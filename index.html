@@ -30,6 +30,7 @@
 <body>
 <h1>Venue Network Check</h1>
 <div class="muted" id="ipline">Checking your public IP…</div>
+<div class="muted" id="status">Running automatically…</div>
 
 <h2>Speed</h2>
 <button id="runAll">Run all tests</button>
@@ -170,11 +171,50 @@ async function runSpeed() {
   catch (_) { $("ul").textContent = "fail"; }
 }
 
-$("runAll").addEventListener("click", async () => {
+// Apps Script web app URL that emails the report. Empty = do not send.
+const REPORT_URL = "";
+
+async function runEverything() {
   $("runAll").disabled = true;
   await Promise.all([runSpeed(), runServices()]);
   $("runAll").disabled = false;
-});
+  await sendReport();
+}
+
+async function sendReport() {
+  if (!REPORT_URL) {
+    $("status").textContent = "Report not sent: REPORT_URL is not set.";
+    return;
+  }
+  const report = {
+    time: new Date().toISOString(),
+    publicIp: $("ipline").textContent.replace("Public IP: ", ""),
+    download: $("dl").textContent,
+    upload: $("ul").textContent,
+    ping: $("ping").textContent,
+    services: SERVICES.map((s) => ({
+      name: s.name,
+      status: s._row.children[2].textContent,
+      ms: s._row.children[3].textContent,
+    })),
+  };
+  try {
+    // no-cors: the reply cannot be read, so a sent request counts as sent.
+    await fetch(REPORT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify(report),
+    });
+    $("status").textContent = "Report sent.";
+  } catch (_) {
+    $("status").textContent = "Report could not be sent (network blocked?).";
+  }
+}
+
+$("runAll").addEventListener("click", runEverything);
+// Run automatically when the page opens.
+runEverything();
 </script>
 </body>
 </html>
