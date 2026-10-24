@@ -34,6 +34,7 @@
 
 <h2>Speed</h2>
 <button id="runAll">Run all tests</button>
+<button id="sendReport" disabled>Send report to me</button>
 <div class="speeds">
   <div class="speed">Download<b id="dl">–</b><span class="muted">Mbps</span></div>
   <div class="speed">Upload<b id="ul">–</b><span class="muted">Mbps</span></div>
@@ -176,9 +177,11 @@ const REPORT_URL = "";
 
 async function runEverything() {
   $("runAll").disabled = true;
+  $("sendReport").disabled = true;
   await Promise.all([runSpeed(), runServices()]);
   $("runAll").disabled = false;
-  await sendReport();
+  $("sendReport").disabled = false;
+  $("status").textContent = "Tests finished. Press Send report to me to email the results.";
 }
 
 async function sendReport() {
@@ -186,6 +189,7 @@ async function sendReport() {
     $("status").textContent = "Report not sent: REPORT_URL is not set.";
     return;
   }
+  $("sendReport").disabled = true;
   const report = {
     time: new Date().toISOString(),
     publicIp: $("ipline").textContent.replace("Public IP: ", ""),
@@ -213,7 +217,8 @@ async function sendReport() {
 }
 
 $("runAll").addEventListener("click", runEverything);
-// Run automatically when the page opens.
+$("sendReport").addEventListener("click", sendReport);
+// Run automatically when the page opens. Sending needs the button.
 runEverything();
 </script>
 </body>
