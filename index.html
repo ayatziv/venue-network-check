@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Venue Network Check</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#666; --ok:#1a7f37; --bad:#c62828; --warn:#b26a00; --line:#ddd; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#111; --fg:#eee; --muted:#999; --ok:#4cd27a; --bad:#ff6b6b; --warn:#ffb347; --line:#333; }
+  }
+  :root[data-theme="dark"] { --bg:#111; --fg:#eee; --muted:#999; --ok:#4cd27a; --bad:#ff6b6b; --warn:#ffb347; --line:#333; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:17px; margin:24px 0 8px; }
+  .muted { color:var(--muted); font-size:13px; }
+  button { font:inherit; padding:10px 16px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .speeds { display:flex; gap:12px; flex-wrap:wrap; margin:12px 0; }
+  .speed { flex:1 1 140px; border:1px solid var(--line); border-radius:8px; padding:12px; }
+  .speed b { display:block; font-size:26px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); word-break:break-all; }
+  .ok { color:var(--ok); font-weight:600; }
+  .bad { color:var(--bad); font-weight:600; }
+  .slow { color:var(--warn); font-weight:600; }
+  .wrap { overflow-x:auto; }
+</style>
+</head>
+<body>
+<h1>Venue Network Check</h1>
+<div class="muted" id="ipline">Checking your public IP…</div>
+
+<h2>Speed</h2>
+<button id="runAll">Run all tests</button>
+<div class="speeds">
+  <div class="speed">Download<b id="dl">–</b><span class="muted">Mbps</span></div>
+  <div class="speed">Upload<b id="ul">–</b><span class="muted">Mbps</span></div>
+  <div class="speed">Ping<b id="ping">–</b><span class="muted">ms</span></div>
+</div>
+
+<h2>Service reachability</h2>
+<div class="wrap">
+<table>
+  <thead><tr><th>Service</th><th>Host</th><th>Status</th><th>Time (ms)</th></tr></thead>
+  <tbody id="svc"></tbody>
+</table>
+</div>
+<p class="muted">"Reachable" means the request got a response. A TLS or CORS error still counts as reachable here. "Blocked" means it failed or timed out (firewall, DNS, or no route).</p>
+
+<script>
+const SERVICES = [
+  { name: "ElevenLabs API", url: "https://api.elevenlabs.io/v1/models" },
+  { name: "ElevenLabs API (US)", url: "https://api.us.elevenlabs.io/v1/models" },
+  { name: "OpenAI API", url: "https://api.openai.com/v1/models" },
+  { name: "Anthropic API", url: "https://api.anthropic.com/v1/messages" },
+  { name: "Telegram Bot API", url: "https://api.telegram.org" },
+  { name: "Twilio API", url: "https://api.twilio.com" },
+  { name: "Railway (knowledge summary)", url: "https://peterphone-production.up.railway.app" },
+  { name: "Vercel (presentation)", url: "https://peter-report-presentation.vercel.app" },
+  { name: "Google Apps Script", url: "https://script.google.com" },
+  { name: "GitHub Pages", url: "https://ayatziv.github.io" },
+  { name: "Google Fonts", url: "https://fonts.googleapis.com" },
+  { name: "ngrok (Pixel Streaming)", url: "https://pixelstreamer.ngrok.dev" },
+  { name: "Speed test server", url: "https://speed.cloudflare.com/__down?bytes=1" },
+];
+const TIMEOUT_MS = 8000;
+const DOWN_BYTES = 10 * 1000 * 1000;
+const UP_BYTES = 4 * 1000 * 1000;
+
+const $ = (id) => document.getElementById(id);
+
+function withTimeout(promise, ms) {
+  let t;
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => { t = setTimeout(() => rej(new Error("timeout")), ms); }),
+  ]).finally(() => clearTimeout(t));
+}
+
+// Public IP so the venue can be identified in the results.
+fetch("https://api.ipify.org?format=json")
+  .then((r) => r.json())
+  .then((j) => { $("ipline").textContent = "Public IP: " + j.ip; })
+  .catch(() => { $("ipline").textContent = "Public IP: unavailable (blocked?)"; });
+
+async function checkService(svc) {
+  const start = performance.now();
+  try {
+    // no-cors: we only need to know a response arrived, not its content.
+    await withTimeout(fetch(svc.url, { mode: "no-cors", cache: "no-store" }), TIMEOUT_MS);
+    return { ok: true, ms: Math.round(performance.now() - start) };
+  } catch (e) {
+    return { ok: false, ms: Math.round(performance.now() - start), err: e.message };
+  }
+}
+
+function renderServices() {
+  $("svc").innerHTML = "";
+  for (const s of SERVICES) {
+    const tr = document.createElement("tr");
+    const host = new URL(s.url).host;
+    tr.innerHTML = `<td>${s.name}</td><td>${host}</td><td class="muted">testing…</td><td></td>`;
+    $("svc").appendChild(tr);
+    s._row = tr;
+  }
+}
+
+async function runServices() {
+  renderServices();
+  await Promise.all(SERVICES.map(async (s) => {
+    const r = await checkService(s);
+    const cells = s._row.children;
+    if (r.ok) {
+      const cls = r.ms > 1000 ? "slow" : "ok";
+      cells[2].innerHTML = `<span class="${cls}">Reachable</span>`;
+    } else {
+      cells[2].innerHTML = `<span class="bad">Blocked</span>`;
+    }
+    cells[3].textContent = r.ms;
+  }));
+}
+
+// Ping: median of several small requests to the speed-test server.
+async function measurePing() {
+  const samples = [];
+  for (let i = 0; i < 5; i++) {
+    const t = performance.now();
+    try {
+      await withTimeout(fetch("https://speed.cloudflare.com/__down?bytes=1", { cache: "no-store" }), TIMEOUT_MS);
+      samples.push(performance.now() - t);
+    } catch (_) {}
+  }
+  if (!samples.length) return null;
+  samples.sort((a, b) => a - b);
+  return Math.round(samples[Math.floor(samples.length / 2)]);
+}
+
+async function measureDownload() {
+  const t = performance.now();
+  const res = await withTimeout(
+    fetch(`https://speed.cloudflare.com/__down?bytes=${DOWN_BYTES}`, { cache: "no-store" }),
+    30000
+  );
+  const buf = await res.arrayBuffer();
+  const secs = (performance.now() - t) / 1000;
+  return (buf.byteLength * 8) / secs / 1e6;
+}
+
+async function measureUpload() {
+  const body = new Uint8Array(UP_BYTES);
+  const t = performance.now();
+  await withTimeout(
+    fetch("https://speed.cloudflare.com/__up", { method: "POST", body, cache: "no-store" }),
+    30000
+  );
+  const secs = (performance.now() - t) / 1000;
+  return (UP_BYTES * 8) / secs / 1e6;
+}
+
+async function runSpeed() {
+  $("dl").textContent = "…";
+  $("ul").textContent = "…";
+  $("ping").textContent = "…";
+  const ping = await measurePing();
+  $("ping").textContent = ping ?? "fail";
+  try { $("dl").textContent = (await measureDownload()).toFixed(1); }
+  catch (_) { $("dl").textContent = "fail"; }
+  try { $("ul").textContent = (await measureUpload()).toFixed(1); }
+  catch (_) { $("ul").textContent = "fail"; }
+}
+
+$("runAll").addEventListener("click", async () => {
+  $("runAll").disabled = true;
+  await Promise.all([runSpeed(), runServices()]);
+  $("runAll").disabled = false;
+});
+</script>
+</body>
+</html>
