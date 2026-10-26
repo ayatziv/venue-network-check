@@ -33,11 +33,10 @@
 <body>
 <h1>Venue Network Check</h1>
 <div class="muted" id="ipline">Checking your public IP…</div>
-<div class="muted" id="status">Running automatically…</div>
+<div class="muted" id="status">Press Start test to begin.</div>
 
 <h2>Speed</h2>
-<button id="statusBtn" class="running" disabled>Testing…</button>
-<p><button id="runAll">Run again</button></p>
+<button id="statusBtn" class="running">Start test</button>
 <div class="speeds">
   <div class="speed">Download<b id="dl">–</b><span class="muted">Mbps</span></div>
   <div class="speed">Upload<b id="ul">–</b><span class="muted">Mbps</span></div>
@@ -185,11 +184,10 @@ function setStatusBtn(text, state) {
 }
 
 async function runEverything() {
-  $("runAll").disabled = true;
+  $("statusBtn").disabled = true;
   setStatusBtn("Testing…", "running");
   $("status").textContent = "Running tests…";
   await Promise.all([runSpeed(), runServices()]);
-  $("runAll").disabled = false;
   setStatusBtn("Tests done", "done");
   await sendReport();
 }
@@ -226,9 +224,8 @@ async function sendReport() {
   }
 }
 
-$("runAll").addEventListener("click", runEverything);
-// Run automatically when the page opens. The report is emailed once the button turns green.
-runEverything();
+// The test starts only when the button is pressed. The report is emailed once the button turns green.
+$("statusBtn").addEventListener("click", runEverything);
 </script>
 </body>
 </html>
