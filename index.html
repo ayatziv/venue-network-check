@@ -27,6 +27,7 @@
   .ok { color:var(--ok); font-weight:600; }
   .bad { color:var(--bad); font-weight:600; }
   .slow { color:var(--warn); font-weight:600; }
+  .verdict { font-weight:700; font-size:16px; margin:12px 0 0; }
   .wrap { overflow-x:auto; }
 </style>
 </head>
@@ -52,6 +53,16 @@
 </div>
 <p class="muted">"Reachable" means the request got a response. A TLS or CORS error still counts as reachable here. "Blocked" means it failed or timed out (firewall, DNS, or no route).</p>
 
+<h2>Streaming (WebRTC)</h2>
+<div class="wrap">
+<table>
+  <thead><tr><th>Check</th><th>Result</th><th>Details</th></tr></thead>
+  <tbody id="rtc"></tbody>
+</table>
+</div>
+<p class="verdict" id="verdict"></p>
+<p class="muted">Checks whether the broadcast can reach our relay server from this network. PASS on the relay checks means the stream can get through.</p>
+
 <script>
 const SERVICES = [
   { name: "ElevenLabs API", url: "https://api.elevenlabs.io/v1/models" },
@@ -72,7 +83,19 @@ const TIMEOUT_MS = 8000;
 const DOWN_BYTES = 10 * 1000 * 1000;
 const UP_BYTES = 4 * 1000 * 1000;
 
+// Relay server for the streaming checks.
+const TURN_HOST = "157.180.23.98";
+const TURN_PORT = 3478;
+const RTC_TIMEOUT_MS = 8000;
+// TURN login. Keep this null in the published page: the password would be public.
+// See HANDOFF_WEBRTC.md for the options.
+const TURN_CREDS = null; // { username: "...", credential: "..." }
+
+// Apps Script web app URL that emails the report. Empty = do not send.
+const REPORT_URL = "https://script.google.com/macros/s/AKfycbw4aNN8ZIVKRfSc0AuAPv7EvBADhlGS2wrP41DcBOKVNPlhRpbv5a_XLJsiKRaTvrV2vg/exec";
+
 const $ = (id) => document.getElementById(id);
+let rtcResult = null;
 
 function withTimeout(promise, ms) {
   let t;
@@ -114,6 +137,7 @@ async function runServices() {
   renderServices();
   await Promise.all(SERVICES.map(async (s) => {
     const r = await checkService(s);
+    s._ok = r.ok;
     const cells = s._row.children;
     if (r.ok) {
       const cls = r.ms > 1000 ? "slow" : "ok";
@@ -174,8 +198,159 @@ async function runSpeed() {
   catch (_) { $("ul").textContent = "fail"; }
 }
 
-// Apps Script web app URL that emails the report. Empty = do not send.
-const REPORT_URL = "https://script.google.com/macros/s/AKfycbw4aNN8ZIVKRfSc0AuAPv7EvBADhlGS2wrP41DcBOKVNPlhRpbv5a_XLJsiKRaTvrV2vg/exec";
+// ---- Streaming (WebRTC) checks ----
+
+// Collects ICE candidates until gathering ends or the timeout passes.
+// Handlers must be set before setLocalDescription so no candidate is missed.
+function gatherCandidates(pc, timeoutMs) {
+  return new Promise((resolve) => {
+    const found = [];
+    const errors = [];
+    const done = () => { clearTimeout(timer); resolve({ found, errors }); };
+    const timer = setTimeout(done, timeoutMs);
+    pc.onicecandidate = (e) => { if (e.candidate) found.push(e.candidate.candidate); else done(); };
+    pc.onicecandidateerror = (e) => errors.push(`${e.errorCode} ${e.errorText || ""}`.trim());
+  });
+}
+
+function hasType(list, type) {
+  return list.some((c) => c.includes(` typ ${type}`));
+}
+
+function checkResult(name, ok, found, errors) {
+  const detail = errors.length
+    ? errors.join("; ")
+    : `${found.length} candidate(s) found`;
+  return { name, ok, status: ok ? "PASS" : "FAIL", detail };
+}
+
+function skipped(name) {
+  return { name, ok: false, status: "SKIPPED", detail: "TURN login not set in this page" };
+}
+
+// STUN: the server must report our public address (srflx candidate).
+async function checkStun() {
+  const name = `STUN over UDP ${TURN_PORT}`;
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: `stun:${TURN_HOST}:${TURN_PORT}` }] });
+  const gathered = gatherCandidates(pc, RTC_TIMEOUT_MS);
+  pc.createDataChannel("probe");
+  await pc.setLocalDescription(await pc.createOffer());
+  const { found, errors } = await gathered;
+  pc.close();
+  return checkResult(name, hasType(found, "srflx"), found, errors);
+}
+
+// TURN relay: only relay candidates are allowed, so PASS means the relay was reached.
+async function checkRelay(transport) {
+  const name = `TURN over ${transport.toUpperCase()} ${TURN_PORT}`;
+  if (!TURN_CREDS) return skipped(name);
+  const pc = new RTCPeerConnection({
+    iceTransportPolicy: "relay",
+    iceServers: [{ urls: `turn:${TURN_HOST}:${TURN_PORT}?transport=${transport}`, ...TURN_CREDS }],
+  });
+  const gathered = gatherCandidates(pc, RTC_TIMEOUT_MS);
+  pc.createDataChannel("probe");
+  await pc.setLocalDescription(await pc.createOffer());
+  const { found, errors } = await gathered;
+  pc.close();
+  return checkResult(name, hasType(found, "relay"), found, errors);
+}
+
+// Loopback: two peers connect through the relay and exchange messages over a data channel.
+async function checkLoopback() {
+  const name = "Media loopback through relay";
+  if (!TURN_CREDS) return skipped(name);
+  const base = `turn:${TURN_HOST}:${TURN_PORT}`;
+  const iceServers = [{ urls: [`${base}?transport=udp`, `${base}?transport=tcp`], ...TURN_CREDS }];
+  const a = new RTCPeerConnection({ iceTransportPolicy: "relay", iceServers });
+  const b = new RTCPeerConnection({ iceTransportPolicy: "relay", iceServers });
+  const errors = [];
+  const queueForA = [];
+  const queueForB = [];
+  let aHasRemote = false;
+  let bHasRemote = false;
+  a.onicecandidate = (e) => { if (e.candidate) (bHasRemote ? b.addIceCandidate(e.candidate) : queueForB.push(e.candidate)); };
+  b.onicecandidate = (e) => { if (e.candidate) (aHasRemote ? a.addIceCandidate(e.candidate) : queueForA.push(e.candidate)); };
+  a.onicecandidateerror = (e) => errors.push(`${e.errorCode} ${e.errorText || ""}`.trim());
+  b.onicecandidateerror = (e) => errors.push(`${e.errorCode} ${e.errorText || ""}`.trim());
+
+  let onEcho = null;
+  const ch = a.createDataChannel("rtt");
+  ch.onmessage = () => { if (onEcho) onEcho(); };
+  b.ondatachannel = (e) => { e.channel.onmessage = (m) => e.channel.send(m.data); };
+
+  let ok = false;
+  let detail = "";
+  try {
+    await a.setLocalDescription(await a.createOffer());
+    await b.setRemoteDescription(a.localDescription);
+    bHasRemote = true;
+    queueForB.splice(0).forEach((c) => b.addIceCandidate(c));
+    await b.setLocalDescription(await b.createAnswer());
+    await a.setRemoteDescription(b.localDescription);
+    aHasRemote = true;
+    queueForA.splice(0).forEach((c) => a.addIceCandidate(c));
+
+    await withTimeout(new Promise((res) => { ch.onopen = res; }), 15000);
+    const rtts = [];
+    for (let i = 0; i < 5; i++) {
+      const t0 = performance.now();
+      await withTimeout(new Promise((res) => { onEcho = res; ch.send("ping" + i); }), 3000);
+      rtts.push(performance.now() - t0);
+    }
+    rtts.sort((x, y) => x - y);
+    ok = true;
+    detail = `5/5 echoes, median ${Math.round(rtts[2])} ms`;
+  } catch (err) {
+    detail = errors.length ? errors.join("; ") : err.message;
+  } finally {
+    a.close();
+    b.close();
+  }
+  return { name, ok, status: ok ? "PASS" : "FAIL", detail };
+}
+
+function rtcVerdict(rows) {
+  const [, udp, tcp, loop] = rows;
+  const anyRelay = udp.ok || tcp.ok;
+  if (!TURN_CREDS) return "Streaming relay test is not set up yet. Only the STUN check ran.";
+  if (loop.ok && anyRelay) return "The stream will work on this network.";
+  if (anyRelay) return "The relay works, but the media test failed. Please send these results to Amir.";
+  if (SERVICES.some((s) => s._ok)) return "This network blocks our streaming relay. Please send these results to Amir.";
+  return "No internet connection, or a Wi-Fi login page is blocking access. Log in to the Wi-Fi and run the test again.";
+}
+
+function renderRtc(rows) {
+  const tbody = $("rtc");
+  tbody.innerHTML = "";
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    const name = document.createElement("td");
+    name.textContent = r.name;
+    const status = document.createElement("td");
+    status.textContent = r.status;
+    status.className = r.status === "PASS" ? "ok" : r.status === "FAIL" ? "bad" : "muted";
+    const detail = document.createElement("td");
+    detail.textContent = r.detail;
+    tr.append(name, status, detail);
+    tbody.appendChild(tr);
+  }
+}
+
+async function runWebRtc() {
+  const rows = [];
+  rows.push(await checkStun());
+  rows.push(await checkRelay("udp"));
+  rows.push(await checkRelay("tcp"));
+  rows.push(await checkLoopback());
+  renderRtc(rows);
+  const verdict = rtcVerdict(rows);
+  $("verdict").textContent = verdict;
+  rtcResult = { rows, verdict };
+  return rtcResult;
+}
+
+// ---- Report and run ----
 
 function setStatusBtn(text, state) {
   const b = $("statusBtn");
@@ -187,17 +362,19 @@ async function runEverything() {
   $("statusBtn").disabled = true;
   setStatusBtn("Testing…", "running");
   $("status").textContent = "Running tests…";
-  await Promise.all([runSpeed(), runServices()]);
+  const [, , rtc] = await Promise.all([runSpeed(), runServices(), runWebRtc()]);
   setStatusBtn("Tests done", "done");
-  await sendReport();
+  await sendReport(rtc);
 }
 
-async function sendReport() {
+async function sendReport(rtc) {
   if (!REPORT_URL) {
     $("status").textContent = "Tests done. Report not sent: REPORT_URL is not set.";
     return;
   }
   $("status").textContent = "Sending report…";
+  const rtcRows = rtc.rows.map((r) => ({ name: r.name, status: `${r.status}: ${r.detail}`, ms: "" }));
+  rtcRows.push({ name: "Streaming verdict", status: rtc.verdict, ms: "" });
   const report = {
     time: new Date().toISOString(),
     publicIp: $("ipline").textContent.replace("Public IP: ", ""),
@@ -208,7 +385,7 @@ async function sendReport() {
       name: s.name,
       status: s._row.children[2].textContent,
       ms: s._row.children[3].textContent,
-    })),
+    })).concat(rtcRows),
   };
   try {
     // no-cors: the reply cannot be read, so a sent request counts as sent.
