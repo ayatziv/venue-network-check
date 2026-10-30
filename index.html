@@ -34,9 +34,6 @@
 <body>
 <h1>Venue Network Check</h1>
 <div class="muted" id="ipline">Checking your public IP and location…</div>
-<label class="muted">Venue or Wi-Fi name (type it before the test):
-  <input id="venueName" type="text" placeholder="e.g. Venue name, Wi-Fi name" style="font:inherit;padding:6px;width:100%;max-width:320px;margin-top:4px;box-sizing:border-box;">
-</label>
 <div class="muted" id="status">Press Start test to begin.</div>
 
 <h2>Speed</h2>
@@ -387,7 +384,6 @@ async function sendReport(rtc) {
   const rtcRows = rtc.rows.map((r) => ({ name: r.name, status: `${r.status}: ${r.detail}`, ms: "" }));
   rtcRows.push({ name: "Streaming verdict", status: rtc.verdict, ms: "" });
   const venueRows = [
-    { name: "Venue or Wi-Fi name", status: $("venueName").value.trim() || "not entered", ms: "" },
     { name: "Location", status: `${geo.location} (${geo.isp})`, ms: "" },
   ];
   const report = {
